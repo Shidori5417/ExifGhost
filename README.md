@@ -41,3 +41,7 @@ main.py    # giriş noktası
 gui.py     # CustomTkinter arayüzü
 logic.py   # format bazlı temizleyiciler (clean_file)
 ```
+
+## Lisans
+
+[MIT](LICENSE)

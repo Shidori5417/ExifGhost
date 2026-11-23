@@ -1,5 +1,8 @@
 # 👻 ExifGhost
 
+[![CI](https://github.com/Shidori5417/ExifGhost/actions/workflows/ci.yml/badge.svg)](https://github.com/Shidori5417/ExifGhost/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Fotoğraf, ses ve video dosyalarındaki metadata'yı tek tıkla temizleyen masaüstü uygulaması. İşlem tamamen yereldir, hiçbir veri dışarı çıkmaz.
 
 | Dosyalar eklendi | Temizleme bitti |
@@ -18,7 +21,7 @@ Fotoğraf, ses ve video dosyalarındaki metadata'yı tek tıkla temizleyen masa�
 | Tür | Formatlar | Yöntem | Silinenler | Korunanlar |
 |---|---|---|---|---|
 | Görsel | JPG, JPEG | **Kayıpsız** marker temizliği: JPEG segment akışı yeniden yazılır, piksel (entropi) verisi birebir kopyalanır; yön != 1 ise `jpegtran` ile kayıpsız döndürme, olmazsa yeniden kodlama (aşağıya bakın) | EXIF (GPS dahil), XMP, IPTC/Photoshop (APP13), COM yorum, MPF ve diğer APPn segmentleri, JFIF içi küçük resim, EOI sonrası ek veri | Tarama/kuantalama/Huffman verisi (aşamalı JPEG dahil), JFIF (APP0), ICC renk profili (APP2), Adobe APP14 (renk çözümü için); EXIF yönü piksellere uygulanır, görüntü yan dönmez |
-| Görsel | PNG, APNG | Pillow ile yeniden kayıt | tEXt/zTXt/iTXt (XMP dahil), eXIf, dpi vb. | ICC renk profili, saydamlık; animasyonlu PNG'de tüm kareler, süreler ve döngü sayısı |
+| Görsel | PNG (APNG dahil) | Pillow ile yeniden kayıt | tEXt/zTXt/iTXt (XMP dahil), eXIf, dpi vb. | ICC renk profili, saydamlık; animasyonlu PNG'de tüm kareler, süreler ve döngü sayısı |
 | Ses | MP3, FLAC, OGG, M4A, AAC | mutagen ile etiketlerin silinmesi | ID3/Vorbis/MP4 etiketleri; gömülü kapak görselleri (MP4 `covr`, FLAC PICTURE blokları, OGG `METADATA_BLOCK_PICTURE`) | Ses verisi (yeniden kodlanmaz) |
 | Ses | WAV | RIFF dosyası yeniden yazılır | `LIST/INFO`, `id3 `, `bext`, `iXML`, XMP vb. tüm ek chunk'lar | Yalnızca `fmt `, `fact`, `data`; ses verisi birebir |
 | Video | MP4, MOV, M4V | **ffmpeg** ile akış kopyalama (`-c copy`) | Konteyner ve akış etiketleri (GPS `location` dahil), bölümler, kapak görseli, zamanlı veri akışları | Video/ses/altyazı akışları (yeniden kodlanmaz, kalite kaybı olmaz) |

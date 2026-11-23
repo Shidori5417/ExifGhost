@@ -404,6 +404,7 @@ class App(ctk.CTk):
         success = sum(1 for r in results if r.status == "success")
         errors  = sum(1 for r in results if r.status == "error")
         skipped = sum(1 for r in results if r.status == "skipped")
+        reenc   = sum(1 for r in results if r.reencoded)
         problems = [f"• {r.original_path.name}: {r.error_msg}"
                     for r in results if r.status != "success" and r.error_msg]
 
@@ -420,6 +421,9 @@ class App(ctk.CTk):
                f"Temizlenen dosyalar '_cleaned' son ekiyle\n"
                f"orijinalin yanına kaydedildi (mevcut dosyanın\n"
                f"üzerine yazılmaz, '_cleaned (2)' gibi numaralanır).")
+        if reenc:
+            msg += (f"\n\n🔁  {reenc} JPEG yön (Orientation) düzeltmesi için yeniden "
+                    "kodlandı (kayıplı).")
         if problems:
             msg += "\n\nSorunlar:\n" + "\n".join(problems[:8])
             if len(problems) > 8:

@@ -1,6 +1,7 @@
 """logic.py testleri — ekran gerektirmez (GUI modülü import edilmez)."""
 from __future__ import annotations
 
+import base64
 import json
 import shutil
 import struct
@@ -10,9 +11,12 @@ from pathlib import Path
 
 import piexif
 import pytest
+from mutagen.flac import FLAC, Picture
 from mutagen.id3 import ID3, TIT2
+from mutagen.mp4 import MP4, MP4Cover
+from mutagen.oggvorbis import OggVorbis
 from mutagen.mp3 import MP3
-from PIL import Image, ImageSequence
+from PIL import Image, ImageChops, ImageOps, ImageSequence
 
 import logic
 from logic import clean_file
@@ -313,3 +317,247 @@ def test_video_without_ffmpeg_fails_clearly(tmp_path, monkeypatch):
     assert "ffmpeg" in res.error_msg
     assert res.cleaned_path is None
     assert not list(tmp_path.glob("*_cleaned*"))
+
+
+# ─── Kayıpsız JPEG temizliği ──────────────────────────────────────────────────
+needs_jpegtran = pytest.mark.skipif(not shutil.which("jpegtran"), reason="jpegtran kurulu değil")
+
+
+def noisy_image(size=(64, 48), seed=1) -> Image.Image:
+    import random
+    rnd = random.Random(seed)
+    img = Image.new("RGB", size)
+    img.putdata([(rnd.randrange(256), rnd.randrange(256), rnd.randrange(256))
+                 for _ in range(size[0] * size[1])])
+    return img
+
+
+def inject(path: Path, *segments: tuple[int, bytes]) -> None:
+    data = path.read_bytes()
+    segs = b"".join(b"\xff" + bytes([m]) + struct.pack(">H", len(p) + 2) + p for m, p in segments)
+    path.write_bytes(data[:2] + segs + data[2:])
+
+
+def pixels(path: Path) -> tuple:
+    with Image.open(path) as im:
+        im.load()
+        return im.mode, im.size, im.tobytes()
+
+
+def make_dirty_jpeg(path: Path, progressive: bool, icc: bytes | None = None) -> None:
+    kw = {"progressive": True} if progressive else {}
+    if icc:
+        kw["icc_profile"] = icc
+    noisy_image().save(path, "JPEG", quality=80, comment=b"GIZLI_COM",
+                       exif=piexif.dump({"0th": {piexif.ImageIFD.Make: b"GIZLI_EXIF"}}), **kw)
+    inject(path,
+           (0xE1, b"http://ns.adobe.com/xap/1.0/\x00<x:xmpmeta>GIZLI_XMP</x:xmpmeta>"),
+           (0xED, b"Photoshop 3.0\x008BIM\x04\x04GIZLI_IPTC"),
+           (0xE5, b"GIZLI_APP5"))
+
+
+@pytest.mark.parametrize("progressive", [False, True])
+def test_jpeg_lossless_pixels_identical_and_metadata_gone(tmp_path, progressive):
+    src = tmp_path / "p.jpg"
+    make_dirty_jpeg(src, progressive)
+    res = clean_file(src)
+    assert res.status == "success" and not res.reencoded
+    out = res.cleaned_path.read_bytes()
+    for secret in (b"GIZLI_COM", b"GIZLI_EXIF", b"GIZLI_XMP", b"GIZLI_IPTC", b"GIZLI_APP5", b"Exif"):
+        assert secret not in out
+    assert pixels(res.cleaned_path) == pixels(src)          # piksel-piksel aynı
+    with Image.open(res.cleaned_path) as im:
+        assert bool(im.info.get("progressive") or im.info.get("progression")) == progressive
+    # entropi verisi bayt bayt aynı: çıktı yalnızca orijinalin alt dizisi olmalı
+    assert len(out) < len(src.read_bytes())
+    for f in ("XMP", "IPTC/Photoshop", "COM (yorum)", "Make"):
+        assert f in res.removed_fields
+
+
+def test_jpeg_lossless_keeps_icc_jfif_and_adobe(tmp_path):
+    from PIL import ImageCms
+    icc = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    src = tmp_path / "k.jpg"
+    make_dirty_jpeg(src, False, icc=icc)
+    inject(src, (0xEE, b"Adobe\x00\x64\x00\x00\x00\x00\x01"))
+    res = clean_file(src)
+    out = res.cleaned_path.read_bytes()
+    assert b"JFIF\x00" in out and b"Adobe" in out
+    with Image.open(res.cleaned_path) as im:
+        assert im.info.get("icc_profile") == icc
+    assert pixels(res.cleaned_path) == pixels(src)
+
+
+def test_strip_jpeg_segments_parsing_edge_cases():
+    # dolgu 0xFF'ler, FF00 / RSTn entropi içinde, EOI sonrası çöp
+    import io
+    buf = io.BytesIO()
+    noisy_image((48, 32)).save(buf, "JPEG", restart_marker_blocks=1)
+    data = buf.getvalue()
+    assert b"\xff\xd0" in data                               # RST işaretleri gerçekten var
+    padded = data[:2] + b"\xff\xff\xff" + data[2:] + b"GARBAGE" + b"\xff\xd8" + b"EKLENTI"
+    clean, dropped = logic.strip_jpeg_segments(padded)
+    assert clean.endswith(b"\xff\xd9") and b"GARBAGE" not in clean and b"EKLENTI" not in clean
+    assert "EOI sonrası veri" in dropped
+    a, b = io.BytesIO(data), io.BytesIO(clean)
+    with Image.open(a) as ia, Image.open(b) as ib:
+        assert ia.tobytes() == ib.tobytes()
+
+
+@pytest.mark.parametrize("bad", [b"", b"\x89PNG", b"\xff\xd8", b"\xff\xd8\xff\xe1\x00\x02",
+                                 b"\xff\xd8\xff\xe1\xff\xff\x00"])
+def test_strip_jpeg_segments_rejects_corrupt(bad):
+    with pytest.raises(ValueError):
+        logic.strip_jpeg_segments(bad)
+
+
+def test_corrupt_jpeg_gives_error_and_no_output(tmp_path):
+    src = tmp_path / "bad.jpg"
+    src.write_bytes(b"\xff\xd8\xff\xe1\xff\xff\x00")
+    res = clean_file(src)
+    assert res.status == "error" and not list(tmp_path.glob("*_cleaned*"))
+
+
+def test_jfif_thumbnail_dropped(tmp_path):
+    src = tmp_path / "t.jpg"
+    Image.new("RGB", (16, 16)).save(src, "JPEG")
+    data = src.read_bytes()
+    assert data[2:4] == b"\xff\xe0"
+    seg_len = struct.unpack(">H", data[4:6])[0]
+    jfif = bytearray(data[6:4 + seg_len])
+    jfif[12:14] = b"\x02\x02"
+    jfif += b"THUMBNAIL_SECRET" * 0 + b"\x01" * 12                # 2x2 RGB
+    src.write_bytes(data[:2] + b"\xff\xe0" + struct.pack(">H", len(jfif) + 2) + bytes(jfif)
+                    + data[4 + seg_len:])
+    res = clean_file(src)
+    out = res.cleaned_path.read_bytes()
+    assert b"\x01" * 12 not in out[:40]
+    assert out[4 + 2 + 12:4 + 2 + 14] == b"\x00\x00"
+
+
+@needs_jpegtran
+@pytest.mark.parametrize("orientation", range(2, 9))
+def test_jpeg_orientation_lossless_via_jpegtran(tmp_path, orientation):
+    src = tmp_path / "o.jpg"
+    # 32x16, 4:4:4 -> MCU 8x8'e tam oturur, -perfect geçer
+    img = Image.new("RGB", (32, 16), (255, 0, 0))
+    img.paste((0, 0, 255), (16, 0, 32, 8))
+    img.paste((0, 255, 0), (0, 8, 8, 16))
+    img.save(src, "JPEG", quality=95, subsampling=0,
+             exif=piexif.dump({"0th": {piexif.ImageIFD.Orientation: orientation}}))
+    res = clean_file(src)
+    assert res.status == "success" and not res.reencoded
+    with Image.open(src) as a, Image.open(res.cleaned_path) as b:
+        expected = ImageOps.exif_transpose(a)
+        assert b.size == expected.size
+        assert not b.getexif().get(0x0112)
+        delta = ImageChops.difference(expected.convert("RGB"), b.convert("RGB"))
+        diff = max(hi for _, hi in delta.getextrema())
+    assert diff <= 3
+
+
+def test_jpeg_orientation_fallback_reencodes_and_reports(tmp_path, monkeypatch):
+    monkeypatch.setattr(logic, "_jpegtran", lambda: None)
+    src = tmp_path / "f.jpg"
+    make_jpeg(src, orientation=6)
+    res = clean_file(src)
+    assert res.status == "success" and res.reencoded
+    assert any("yeniden kodlan" in n for n in res.notes)
+    with Image.open(res.cleaned_path) as out:
+        assert out.size == (20, 40)
+        assert out.getpixel((10, 2))[0] > 200 and out.getpixel((10, 37))[2] > 200
+    # kalite tabloları kaynaktan alınmış olmalı
+    with Image.open(src) as a, Image.open(res.cleaned_path) as b:
+        assert a.quantization == b.quantization
+
+
+@needs_jpegtran
+def test_jpeg_orientation_non_mcu_falls_back_when_perfect_fails(tmp_path):
+    src = tmp_path / "n.jpg"
+    make_jpeg(src, orientation=6)       # 40x20, 4:2:0 -> -perfect başarısız
+    res = clean_file(src)
+    assert res.reencoded and res.cleaned_path.exists()
+
+
+def test_jpeg_orientation_1_is_lossless_path(tmp_path):
+    src = tmp_path / "one.jpg"
+    make_jpeg(src, orientation=1)
+    res = clean_file(src)
+    assert not res.reencoded and not res.notes
+    assert pixels(res.cleaned_path) == pixels(src)
+
+
+# ─── Gömülü kapak görselleri (M4A / FLAC / OGG) ───────────────────────────────
+def cover_png() -> bytes:
+    import io
+    from PIL.PngImagePlugin import PngInfo
+    info = PngInfo()
+    info.add_text("Secret", "GIZLI_KAPAK")
+    buf = io.BytesIO()
+    Image.new("RGB", (16, 16), (200, 10, 10)).save(buf, "PNG", pnginfo=info)
+    return buf.getvalue()
+
+
+def ffmpeg_audio(path: Path, *extra: str) -> None:
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=d=0.3", *extra, str(path)],
+                   check=True)
+
+
+def flac_picture() -> Picture:
+    pic = Picture()
+    pic.type, pic.mime, pic.data = 3, "image/png", cover_png()
+    pic.width = pic.height = 16
+    pic.depth = 24
+    return pic
+
+
+@needs_ffmpeg
+def test_m4a_cover_art_removed(tmp_path):
+    src = tmp_path / "c.m4a"
+    ffmpeg_audio(src, "-c:a", "aac")
+    mp4 = MP4(src)
+    mp4["\xa9nam"] = ["Baslik"]
+    mp4["covr"] = [MP4Cover(cover_png(), imageformat=MP4Cover.FORMAT_PNG)]
+    mp4.save()
+    assert b"GIZLI_KAPAK" in sha(src)
+    res = clean_file(src)
+    assert res.status == "success"
+    assert b"GIZLI_KAPAK" not in sha(res.cleaned_path)
+    tags = MP4(res.cleaned_path).tags
+    assert not tags or "covr" not in tags
+    assert "covr" in res.removed_fields
+    assert MP4(res.cleaned_path).info.length > 0
+
+
+@needs_ffmpeg
+def test_flac_cover_art_removed(tmp_path):
+    src = tmp_path / "c.flac"
+    ffmpeg_audio(src, "-c:a", "flac")
+    fl = FLAC(src)
+    fl["title"] = "Baslik"
+    fl.add_picture(flac_picture())
+    fl.save()
+    assert b"GIZLI_KAPAK" in sha(src)
+    res = clean_file(src)
+    assert res.status == "success"
+    assert b"GIZLI_KAPAK" not in sha(res.cleaned_path)
+    assert FLAC(res.cleaned_path).pictures == []
+    assert res.removed_fields and "PICTURE" in " ".join(res.removed_fields).upper()
+    assert FLAC(res.cleaned_path).info.length > 0
+
+
+@needs_ffmpeg
+def test_ogg_cover_art_removed(tmp_path):
+    src = tmp_path / "c.ogg"
+    ffmpeg_audio(src, "-c:a", "libvorbis")
+    og = OggVorbis(src)
+    og["title"] = ["Baslik"]
+    og["metadata_block_picture"] = [base64.b64encode(flac_picture().write()).decode("ascii")]
+    og.save()
+    assert b"metadata_block_picture" in sha(src).lower()
+    res = clean_file(src)
+    assert res.status == "success"
+    out = OggVorbis(res.cleaned_path)
+    assert not out.tags or "metadata_block_picture" not in {k.lower() for k in out.tags.keys()}
+    assert b"metadata_block_picture" not in sha(res.cleaned_path).lower()
+    assert out.info.length > 0

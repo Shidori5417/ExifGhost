@@ -8,12 +8,14 @@ import json
 import shutil
 import struct
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 import piexif
 from mutagen import File as MutagenFile
+from mutagen.flac import FLAC
 from mutagen.id3 import ID3, ID3NoHeaderError
 from PIL import Image, ImageOps, ImageSequence
 from PIL.PngImagePlugin import PngInfo
@@ -44,6 +46,8 @@ class CleanResult:
     status:        Literal["success", "skipped", "error"] = "skipped"
     removed_fields: list[str] = field(default_factory=list)
     error_msg:     str | None = None
+    reencoded:     bool = False          # True: piksel verisi yeniden sıkıştırıldı (kayıplı)
+    notes:         list[str] = field(default_factory=list)
 
 
 # ─── Yardımcı ─────────────────────────────────────────────────────────────────
@@ -97,20 +101,185 @@ def _collect_jpeg_extras(img: Image.Image) -> list[str]:
     return extras
 
 
+# ─── JPEG: kayıpsız marker temizliği ──────────────────────────────────────────
+_ORIENT_TAG = 0x0112
+# EXIF Orientation -> jpegtran dönüşüm argümanları (görüntüyü dik gösterecek işlem)
+_JPEGTRAN_OPS: dict[int, list[str]] = {
+    2: ["-flip", "horizontal"],
+    3: ["-rotate", "180"],
+    4: ["-flip", "vertical"],
+    5: ["-transpose"],
+    6: ["-rotate", "90"],
+    7: ["-transverse"],
+    8: ["-rotate", "270"],
+}
+
+
+def _jpegtran() -> str | None:
+    return shutil.which("jpegtran")
+
+
+def _marker_label(m: int) -> str:
+    if 0xE0 <= m <= 0xEF:
+        return f"APP{m - 0xE0}"
+    if m == 0xFE:
+        return "COM"
+    return f"0xFF{m:02X}"
+
+
+def _keep_segment(m: int, payload: bytes) -> bytes | None:
+    """Segmenti tutmak için (güncellenmiş) payload'ı, atmak için None döner."""
+    if m == 0xE0:                                   # APP0
+        if not payload.startswith(b"JFIF\0") or len(payload) < 14:
+            return None                             # JFXX vb. atılır
+        # JFIF içi küçük resim (orijinalin önizlemesi olabilir) atılır
+        return payload[:12] + b"\0\0"
+    if m == 0xE2:                                   # APP2
+        return payload if payload.startswith(b"ICC_PROFILE\0") else None   # MPF vb. atılır
+    if m == 0xEE:                                   # APP14
+        return payload if payload.startswith(b"Adobe") else None
+    if 0xE1 <= m <= 0xEF or m == 0xFE:              # APP1 (EXIF/XMP), APP13, COM, diğer APPn
+        return None
+    return payload                                  # DQT, SOF*, DHT, DRI, DAC, DNL ...
+
+
+def strip_jpeg_segments(data: bytes) -> tuple[bytes, list[str]]:
+    """JPEG marker akışını yeniden yazar; piksel (entropi) verisine dokunmaz.
+
+    Döner: (temiz bayt dizisi, atılan marker etiketleri). Bozuk/kesik dosyada
+    ValueError fırlatır.
+    """
+    n = len(data)
+    if data[:2] != b"\xff\xd8":
+        raise ValueError("Geçerli bir JPEG değil (SOI yok)")
+    out = bytearray(b"\xff\xd8")
+    dropped: list[str] = []
+    i = 2
+    while True:
+        # marker ara: 0xFF, ardından (varsa) dolgu 0xFF'ler, ardından marker kodu
+        if i >= n:
+            raise ValueError("JPEG kesik: EOI yok")
+        if data[i] != 0xFF:
+            raise ValueError(f"Beklenmeyen bayt, marker bekleniyordu (ofset {i})")
+        while i < n and data[i] == 0xFF:
+            i += 1
+        if i >= n:
+            raise ValueError("JPEG kesik: EOI yok")
+        m = data[i]
+        i += 1
+        if m == 0x00:
+            raise ValueError("Geçersiz marker 0xFF00")
+        if m == 0xD9:                               # EOI: sonrasındaki her şey atılır
+            out += b"\xff\xd9"
+            if data[i:].strip(b"\x00\xff"):
+                dropped.append("EOI sonrası veri")
+            return bytes(out), dropped
+        if m == 0xD8 or m == 0x01 or 0xD0 <= m <= 0xD7:   # bağımsız markerlar (uzunluksuz)
+            if m == 0xD8:
+                raise ValueError("İç içe SOI")
+            out += bytes((0xFF, m))
+            continue
+        if i + 2 > n:
+            raise ValueError("JPEG kesik: segment uzunluğu okunamadı")
+        length = struct.unpack(">H", data[i:i + 2])[0]
+        if length < 2 or i + length > n:
+            raise ValueError(f"Geçersiz segment uzunluğu ({_marker_label(m)})")
+        payload = data[i + 2:i + length]
+        i += length
+        kept = _keep_segment(m, payload)
+        if kept is None:
+            dropped.append(_marker_label(m))
+        else:
+            out += bytes((0xFF, m)) + struct.pack(">H", len(kept) + 2) + kept
+        if m == 0xDA:
+            # SOS: entropi verisi bir sonraki gerçek marker'a kadar aynen kopyalanır
+            # (FF00 dolgusu ve RSTn entropi verisinin parçasıdır). Aşamalı JPEG'de
+            # sonraki taramalar ana döngüde DHT/SOS olarak yeniden işlenir.
+            j = i
+            while True:
+                j = data.find(b"\xff", j)
+                if j < 0 or j + 1 >= n:
+                    raise ValueError("JPEG kesik: EOI yok")
+                nxt = data[j + 1]
+                if nxt == 0x00 or 0xD0 <= nxt <= 0xD7 or nxt == 0xFF:
+                    j += 1 if nxt == 0xFF else 2
+                    continue
+                break
+            out += data[i:j]
+            i = j
+
+
+def _jpeg_orientation(img: Image.Image) -> int:
+    try:
+        return int(img.getexif().get(_ORIENT_TAG, 1) or 1)
+    except Exception:
+        return 1
+
+
+def _jpegtran_rotate(stripped: bytes, op: list[str]) -> bytes | None:
+    """jpegtran ile kayıpsız dönüşüm. Yoksa/başarısızsa (ör. -perfect) None."""
+    exe = _jpegtran()
+    if not exe:
+        return None
+    with tempfile.TemporaryDirectory(prefix="exifghost-") as tmp:
+        src, dst = Path(tmp) / "in.jpg", Path(tmp) / "out.jpg"
+        src.write_bytes(stripped)
+        proc = subprocess.run([exe, "-copy", "icc", *op, "-perfect", "-outfile", str(dst), str(src)],
+                              capture_output=True)
+        if proc.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
+            return None
+        return dst.read_bytes()
+
+
+def _reencode_upright(img: Image.Image, output: Path, icc: bytes | None) -> None:
+    """Yedek yol: pikselleri döndür ve kaynağın kalite tablolarıyla yeniden kodla."""
+    clean = ImageOps.exif_transpose(img)
+    clean.info = {"icc_profile": icc} if icc else {}
+    kw = {"icc_profile": icc} if icc else {}
+    try:
+        # quality="keep" yalnızca JPEG'den açılmış görüntüde çalışır; dönmüş kopyaya
+        # kaynağın nicemleme tablosu ve örnekleme bilgisini aktar.
+        clean.format = "JPEG"
+        clean.quantization = img.quantization              # type: ignore[attr-defined]
+        for attr in ("layers", "layer"):
+            if hasattr(img, attr):
+                setattr(clean, attr, getattr(img, attr))
+        clean.save(output, format="JPEG", quality="keep", **kw)
+    except Exception:
+        clean.save(output, format="JPEG", quality=95, **kw)
+
+
 # ─── Temizleyiciler ───────────────────────────────────────────────────────────
 def _clean_jpeg(path: Path) -> CleanResult:
     result = CleanResult(original_path=path)
     output = _out(path)
     try:
+        data = path.read_bytes()
+        stripped, dropped = strip_jpeg_segments(data)    # bozuk dosyada erken hata
+
         with Image.open(path) as img:
             removed = _collect_exif_keys(img) + _collect_jpeg_extras(img)
+            orientation = _jpeg_orientation(img)
             icc = img.info.get("icc_profile")
-            # Orientation EXIF'i atılacağı için döndürmeyi piksellere uygula
-            clean = ImageOps.exif_transpose(img)
-            # Pillow info içindeki comment/xmp vb. alanları yazabilir; sadece ICC kalsın
-            clean.info = {"icc_profile": icc} if icc else {}
-            clean.save(output, format="JPEG", quality=95,
-                       **({"icc_profile": icc} if icc else {}))
+            covered = {"APP1", "APP13", "COM"}
+            removed += [d for d in dropped if d not in covered]
+            if "APP1" in dropped and not removed:
+                removed.append("APP1")
+
+            if orientation in _JPEGTRAN_OPS:
+                rotated = _jpegtran_rotate(stripped, _JPEGTRAN_OPS[orientation])
+                if rotated is not None:
+                    final, _ = strip_jpeg_segments(rotated)   # jpegtran çıktısını da doğrula
+                    output.write_bytes(final)
+                    result.notes.append(f"Yön (Orientation={orientation}) jpegtran ile kayıpsız uygulandı")
+                else:
+                    _reencode_upright(img, output, icc)
+                    result.reencoded = True
+                    result.notes.append(
+                        f"Yön (Orientation={orientation}) kayıpsız uygulanamadı (jpegtran yok veya "
+                        "boyutlar MCU'ya uymuyor); görüntü yeniden kodlandı (kayıplı)")
+            else:
+                output.write_bytes(stripped)
 
         result.status = "success"
         result.cleaned_path = output
@@ -316,6 +485,11 @@ def _clean_mutagen(path: Path) -> CleanResult:
             except Exception:
                 removed = ["tags"]
             audio.delete()   # tag'leri diskten sil
+        if isinstance(audio, FLAC) and audio.pictures:
+            # FLAC PICTURE blokları Vorbis yorumundan ayrıdır; delete() onlara dokunmaz
+            removed += [f"PICTURE (tür {p.type}, {p.mime})" for p in audio.pictures]
+            audio.clear_pictures()
+            audio.save()
 
         result.status = "success"
         result.cleaned_path = output

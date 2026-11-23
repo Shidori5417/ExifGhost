@@ -52,13 +52,21 @@ class CleanResult:
 
 # ─── Yardımcı ─────────────────────────────────────────────────────────────────
 def _out(path: Path) -> Path:
-    """Çakışmayan çıktı yolu: x_cleaned.ext, doluysa x_cleaned (2).ext, ..."""
+    """Çakışmayan çıktı yolu: x_cleaned.ext, doluysa x_cleaned (2).ext, ...
+
+    Ad atomik olarak (O_CREAT|O_EXCL) rezerve edilir: eş zamanlı iki örnek aynı
+    yolu alamaz. Dönen yolda boş bir dosya vardır; temizleyici üzerine yazar,
+    hata olursa siler.
+    """
     candidate = path.with_stem(f"{path.stem}_cleaned")
     n = 2
-    while candidate.exists():
-        candidate = path.with_stem(f"{path.stem}_cleaned ({n})")
-        n += 1
-    return candidate
+    while True:
+        try:
+            with open(candidate, "xb"):
+                return candidate
+        except FileExistsError:
+            candidate = path.with_stem(f"{path.stem}_cleaned ({n})")
+            n += 1
 
 
 def _ffmpeg() -> str | None:
@@ -303,12 +311,18 @@ def _clean_png(path: Path) -> CleanResult:
 
             if getattr(img, "n_frames", 1) > 1:
                 # APNG: tüm kareleri süre ve döngü bilgisiyle koru
+                # default_image: ilk kare animasyonun parçası olmayan "poster"dır;
+                # süreleri yalnızca gerçek animasyon karelerine ait olmalı.
+                poster = bool(img.info.get("default_image"))
                 frames, durations = [], []
-                for frame in ImageSequence.Iterator(img):
-                    durations.append(frame.info.get("duration", 0))
+                for i, frame in enumerate(ImageSequence.Iterator(img)):
+                    if not (poster and i == 0):
+                        durations.append(frame.info.get("duration", 0))
                     frames.append(frame.copy())
                 img.load()
                 removed = [k for k in img.info if k not in _PNG_STRUCTURAL]
+                if poster:
+                    save_kw["default_image"] = True
                 frames[0].save(output, save_all=True, append_images=frames[1:],
                                duration=durations, loop=img.info.get("loop", 0),
                                **save_kw)
@@ -375,11 +389,11 @@ def _clean_ffmpeg(path: Path) -> CleanResult:
                "-map_metadata", "-1", "-map_chapters", "-1",
                "-map_metadata:s:v", "-1", "-map_metadata:s:a", "-1",
                "-map_metadata:s:s", "-1",
-               "-c", "copy", "-fflags", "+bitexact",
+               "-c", "copy", "-fflags", "+bitexact", "-y",
                "-flags:v", "+bitexact", "-flags:a", "+bitexact",
                str(output)]
         proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0 or not output.exists():
+        if proc.returncode != 0 or not output.exists() or output.stat().st_size == 0:
             raise RuntimeError(f"ffmpeg hata verdi: {proc.stderr.strip()[-500:]}")
         result.status = "success"
         result.cleaned_path = output

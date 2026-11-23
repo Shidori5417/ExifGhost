@@ -141,6 +141,24 @@ def test_apng_frames_and_timing_preserved(tmp_path):
     assert got == [(100, colors[0]), (200, colors[1]), (300, colors[2])]
 
 
+def test_apng_with_default_image_keeps_poster_and_timing(tmp_path):
+    colors = [(255, 0, 0, 255), (0, 255, 0, 255), (0, 0, 255, 255)]
+    poster = Image.new("RGBA", (10, 10), (9, 9, 9, 255))
+    frames = [Image.new("RGBA", (10, 10), c) for c in colors]
+    src = tmp_path / "poster.png"
+    poster.save(src, save_all=True, append_images=frames, default_image=True,
+                duration=[100, 200, 300], loop=2)
+    res = clean_file(src)
+    assert res.status == "success"
+    with Image.open(res.cleaned_path) as out:
+        assert out.info.get("default_image") is True
+        assert out.info.get("loop") == 2
+        got = [(f.info.get("duration"), f.convert("RGBA").getpixel((0, 0)))
+               for f in ImageSequence.Iterator(out)]
+    assert got == [(None, (9, 9, 9, 255)), (100, colors[0]), (200, colors[1]),
+                   (300, colors[2])]
+
+
 def test_png_transparency_kept(tmp_path):
     src = tmp_path / "p.png"
     Image.new("RGBA", (4, 4), (10, 20, 30, 0)).save(src)
@@ -561,3 +579,38 @@ def test_ogg_cover_art_removed(tmp_path):
     assert not out.tags or "metadata_block_picture" not in {k.lower() for k in out.tags.keys()}
     assert b"metadata_block_picture" not in sha(res.cleaned_path).lower()
     assert out.info.length > 0
+
+
+# ─── Çıktı adı rezervasyonu ───────────────────────────────────────────────────
+def test_out_reserves_names_atomically_under_concurrency(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    src = tmp_path / "a.png"
+    src.write_bytes(b"x")
+    with ThreadPoolExecutor(16) as ex:
+        outs = list(ex.map(lambda _: logic._out(src), range(64)))
+    assert len(set(outs)) == 64
+    assert all(o.exists() for o in outs)
+
+
+def test_out_skips_existing_and_reserved(tmp_path):
+    src = tmp_path / "a.png"
+    src.write_bytes(b"x")
+    (tmp_path / "a_cleaned.png").write_bytes(b"old")
+    first = logic._out(src)
+    second = logic._out(src)
+    assert first.name == "a_cleaned (2).png"
+    assert second.name == "a_cleaned (3).png"
+    assert (tmp_path / "a_cleaned.png").read_bytes() == b"old"
+
+
+def test_concurrent_cleans_of_same_source_do_not_collide(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    src = tmp_path / "s.png"
+    Image.new("RGB", (8, 8), (1, 2, 3)).save(src)
+    with ThreadPoolExecutor(8) as ex:
+        results = list(ex.map(lambda _: clean_file(src), range(8)))
+    assert all(r.status == "success" for r in results)
+    assert len({r.cleaned_path for r in results}) == 8
+    for r in results:
+        with Image.open(r.cleaned_path) as out:
+            assert out.getpixel((0, 0)) == (1, 2, 3)

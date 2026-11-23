@@ -4,6 +4,7 @@ CustomTkinter + TkinterDnD2 | Koyu tema | Sürükle-bırak | Thread'li temizleme
 """
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import tkinter as tk
@@ -19,6 +20,8 @@ except ImportError:
     DND_AVAILABLE = False
 
 from logic import clean_file, is_supported, CleanResult
+
+log = logging.getLogger(__name__)
 
 # ─── Design tokens ────────────────────────────────────────────────────────────
 BG      = "#0d0d1a"
@@ -190,6 +193,7 @@ class App(ctk.CTk):
         self.file_rows:  list[FileRow]  = []
         self._queue:     queue.Queue    = queue.Queue()
         self._cleaning   = False
+        self._results:   dict[int, CleanResult] = {}
 
         self._build_window()
         self._build_ui()
@@ -202,8 +206,8 @@ class App(ctk.CTk):
         self.configure(fg_color=BG)
         try:
             self.iconbitmap("assets/icon.ico")
-        except Exception:
-            pass
+        except tk.TclError as exc:   # .ico bazı platformlarda desteklenmez
+            log.warning("Pencere ikonu yüklenemedi: %s", exc)
 
     # ── UI inşası ──
     def _build_ui(self):
@@ -354,6 +358,7 @@ class App(ctk.CTk):
         self._clean_btn.configure(state="disabled", text="⏳  Temizleniyor…")
         self._prog_bar.set(0)
 
+        self._results = {}
         for row in self.file_rows:
             row.set_status("pending")
 
@@ -379,6 +384,9 @@ class App(ctk.CTk):
 
                 elif kind == "result":
                     result: CleanResult = payload
+                    self._results[idx] = result
+                    if result.error_msg:
+                        log.warning("%s: %s", result.original_path.name, result.error_msg)
                     self.file_rows[idx].set_status(result.status)
 
                 elif kind == "done":
@@ -392,12 +400,13 @@ class App(ctk.CTk):
         self._cleaning = False
         self._clean_btn.configure(state="normal", text="🧹  Temizle")
 
-        results = [r for r in
-                   (clean_file.__wrapped__ if hasattr(clean_file, "__wrapped__") else [])
-                   ]  # placeholder; gerçek sonuçlar row'larda
-
-        success = sum(1 for r in self.file_rows if r._status_var.get() == STATUS_ICONS["success"])
-        errors  = sum(1 for r in self.file_rows if r._status_var.get() == STATUS_ICONS["error"])
+        results = list(self._results.values())
+        success = sum(1 for r in results if r.status == "success")
+        errors  = sum(1 for r in results if r.status == "error")
+        skipped = sum(1 for r in results if r.status == "skipped")
+        reenc   = sum(1 for r in results if r.reencoded)
+        problems = [f"• {r.original_path.name}: {r.error_msg}"
+                    for r in results if r.status != "success" and r.error_msg]
 
         self._prog_bar.set(1.0)
         self._prog_lbl.configure(text=f"{total} dosya tamamlandı")
@@ -407,9 +416,18 @@ class App(ctk.CTk):
         msg = (f"İşlem tamamlandı!\n\n"
                f"✅  Başarılı  : {success}\n"
                f"❌  Hata       : {errors}\n"
+               f"⏭  Atlanan    : {skipped}\n"
                f"📁  Toplam    : {total}\n\n"
                f"Temizlenen dosyalar '_cleaned' son ekiyle\n"
-               f"orijinalin yanına kaydedildi.")
+               f"orijinalin yanına kaydedildi (mevcut dosyanın\n"
+               f"üzerine yazılmaz, '_cleaned (2)' gibi numaralanır).")
+        if reenc:
+            msg += (f"\n\n🔁  {reenc} JPEG yön (Orientation) düzeltmesi için yeniden "
+                    "kodlandı (kayıplı).")
+        if problems:
+            msg += "\n\nSorunlar:\n" + "\n".join(problems[:8])
+            if len(problems) > 8:
+                msg += f"\n… ve {len(problems) - 8} dosya daha"
         messagebox.showinfo("ExifGhost — Tamamlandı", msg)
 
         # Progress bar'ı gerçek zamanlı güncelle

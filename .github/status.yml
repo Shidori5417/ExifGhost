@@ -1,0 +1,7 @@
+# Read by github.com/Shidori5417 (profile README) and the portfolio site.
+# Edit when the project's state changes; no need to touch it otherwise.
+# status: active | prototype | released | maintenance | paused | archived
+status: maintenance
+focus:
+  en: "Metadata stripping fixes (JPEG orientation, APNG, MP4/MOV GPS, WAV) with tests and CI."
+  tr: "Metadata temizleme düzeltmeleri (JPEG yönü, APNG, MP4/MOV GPS, WAV), testler ve CI."

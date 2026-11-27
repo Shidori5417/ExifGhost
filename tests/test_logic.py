@@ -19,7 +19,7 @@ from mutagen.mp3 import MP3
 from PIL import Image, ImageChops, ImageOps, ImageSequence
 
 import logic
-from logic import clean_file
+from logic import clean_file, parse_dnd_paths
 
 HAS_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 needs_ffmpeg = pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg/ffprobe kurulu değil")
@@ -614,3 +614,35 @@ def test_concurrent_cleans_of_same_source_do_not_collide(tmp_path):
     for r in results:
         with Image.open(r.cleaned_path) as out:
             assert out.getpixel((0, 0)) == (1, 2, 3)
+
+
+# ─── Sürükle-bırak ayrıştırıcısı ──────────────────────────────────────────────
+def test_parse_dnd_paths_handles_spaces_and_trailing_whitespace():
+    assert parse_dnd_paths("/a/b.jpg  ") == [Path("/a/b.jpg")]
+    assert parse_dnd_paths("/a/b.jpg /c/d e.png") == [Path("/a/b.jpg"), Path("/c/d"), Path("e.png")]
+    assert parse_dnd_paths("{/x y/a.jpg} /z.mp3") == [Path("/x y/a.jpg"), Path("/z.mp3")]
+
+
+def test_parse_dnd_paths_unclosed_brace_does_not_raise():
+    assert parse_dnd_paths("{/x y/a.jpg") == [Path("/x y/a.jpg")]
+    assert parse_dnd_paths("") == []
+    assert parse_dnd_paths("   ") == []
+
+
+# ─── Yedek yeniden kodlama: kalite düşüşü raporlanmalı ────────────────────────
+def test_reencode_fallback_returns_true_when_keep_unavailable(tmp_path):
+    # Düz Image.new görüntüsünde .quantization özniteliği yok → kalite=95 yoluna düşer.
+    out = tmp_path / "fb.jpg"
+    assert logic._reencode_upright(Image.new("RGB", (20, 40)), out, None) is True
+    assert out.exists() and out.stat().st_size > 0
+
+
+def test_jpeg_orientation_fallback_notes_quality_drop(tmp_path, monkeypatch):
+    monkeypatch.setattr(logic, "_jpegtran", lambda: None)
+    monkeypatch.setattr(logic, "_reencode_upright",
+                        lambda img, output, icc: (Image.new("RGB", (20, 40)).save(output, "JPEG"), True)[1])
+    src = tmp_path / "f.jpg"
+    make_jpeg(src, orientation=6)
+    res = clean_file(src)
+    assert res.status == "success" and res.reencoded
+    assert any("95" in n for n in res.notes)

@@ -5,6 +5,8 @@ Her format için bağımsız cleaner; ortak CleanResult arayüzü.
 from __future__ import annotations
 
 import json
+import logging
+import re
 import shutil
 import struct
 import subprocess
@@ -20,6 +22,8 @@ from mutagen.id3 import ID3, ID3NoHeaderError
 from PIL import Image, ImageOps, ImageSequence
 from PIL.PngImagePlugin import PngInfo
 
+log = logging.getLogger(__name__)
+
 # ─── Desteklenen formatlar ────────────────────────────────────────────────────
 SUPPORTED_IMAGE = {".jpg", ".jpeg", ".png"}
 SUPPORTED_AUDIO = {".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wav"}
@@ -32,6 +36,21 @@ _PNG_STRUCTURAL = {"icc_profile", "transparency", "duration", "loop",
 # WAV'da korunan yapısal chunk'lar; geri kalan her şey (LIST/INFO, id3, bext,
 # iXML, XMP, cue vb.) atılır.
 _WAV_KEEP = {b"fmt ", b"fact", b"data"}
+
+
+# Sürükle-bırak metni: boşluklu yollar {…} içinde gelir; kapanmayan { satır sonuna kadar okunur.
+_DND_TOKEN = re.compile(r"\{([^}]*)(?:\}|$)|(\S+)")
+
+
+def parse_dnd_paths(raw: str) -> list[Path]:
+    """tkinterdnd2'nin <<Drop>> metnini yollara ayırır. Bozuk girdide istisna fırlatmaz."""
+    paths: list[Path] = []
+    for m in _DND_TOKEN.finditer(raw):
+        token = m.group(1) if m.group(1) is not None else m.group(2)
+        token = token.strip()
+        if token:
+            paths.append(Path(token))
+    return paths
 
 
 def is_supported(path: Path) -> bool:
@@ -239,8 +258,12 @@ def _jpegtran_rotate(stripped: bytes, op: list[str]) -> bytes | None:
         return dst.read_bytes()
 
 
-def _reencode_upright(img: Image.Image, output: Path, icc: bytes | None) -> None:
-    """Yedek yol: pikselleri döndür ve kaynağın kalite tablolarıyla yeniden kodla."""
+def _reencode_upright(img: Image.Image, output: Path, icc: bytes | None) -> bool:
+    """Yedek yol: pikselleri döndür ve kaynağın kalite tablolarıyla yeniden kodla.
+
+    Kaynak kalite tablolarıyla kodlama başarısız olursa quality=95 ile kodlar ve
+    True döner; çağıran bunu sonuç notlarına yazmalıdır.
+    """
     clean = ImageOps.exif_transpose(img)
     clean.info = {"icc_profile": icc} if icc else {}
     kw = {"icc_profile": icc} if icc else {}
@@ -253,8 +276,11 @@ def _reencode_upright(img: Image.Image, output: Path, icc: bytes | None) -> None
             if hasattr(img, attr):
                 setattr(clean, attr, getattr(img, attr))
         clean.save(output, format="JPEG", quality="keep", **kw)
-    except Exception:
+        return False
+    except Exception as exc:
+        log.warning("quality=keep ile yeniden kodlama başarısız (%s); quality=95 kullanılıyor", exc)
         clean.save(output, format="JPEG", quality=95, **kw)
+        return True
 
 
 # ─── Temizleyiciler ───────────────────────────────────────────────────────────
@@ -281,11 +307,14 @@ def _clean_jpeg(path: Path) -> CleanResult:
                     output.write_bytes(final)
                     result.notes.append(f"Yön (Orientation={orientation}) jpegtran ile kayıpsız uygulandı")
                 else:
-                    _reencode_upright(img, output, icc)
+                    fell_back = _reencode_upright(img, output, icc)
                     result.reencoded = True
                     result.notes.append(
                         f"Yön (Orientation={orientation}) kayıpsız uygulanamadı (jpegtran yok veya "
                         "boyutlar MCU'ya uymuyor); görüntü yeniden kodlandı (kayıplı)")
+                    if fell_back:
+                        result.notes.append(
+                            "Kaynak kalite tabloları kullanılamadı; kalite 95'e düşürüldü")
             else:
                 output.write_bytes(stripped)
 

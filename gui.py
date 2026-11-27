@@ -19,7 +19,7 @@ try:
 except ImportError:
     DND_AVAILABLE = False
 
-from logic import clean_file, is_supported, CleanResult
+from logic import CleanResult, clean_file, is_supported, parse_dnd_paths
 
 log = logging.getLogger(__name__)
 
@@ -167,19 +167,7 @@ class DropZone(ctk.CTkFrame):
 
     def _on_drop(self, event):
         # tkinterdnd2 bize string döner; boşluklu path'ler {} içinde gelir
-        raw: str = event.data
-        paths: list[Path] = []
-        i = 0
-        while i < len(raw):
-            if raw[i] == "{":
-                end = raw.index("}", i)
-                paths.append(Path(raw[i + 1:end]))
-                i = end + 2
-            else:
-                token = raw[i:].split()[0]
-                paths.append(Path(token))
-                i += len(token) + 1
-        self._cb(paths)
+        self._cb(parse_dnd_paths(event.data))
 
 
 # ─── Ana Pencere ──────────────────────────────────────────────────────────────
